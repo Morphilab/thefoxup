@@ -1,0 +1,20 @@
+# thefoxup .gitignore
+
+# Sensitive configuration files
+servers.conf
+servers.yaml
+
+# Execution locks
+*.lock
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and caches
+*.log
+__pycache__/

@@ -1,0 +1,16 @@
+# thefoxup - Remote servers configuration (YAML format)
+# Copy this file to servers.yaml and edit it
+#
+# host accepts: IP address, hostname, or SSH config alias (~/.ssh/config)
+# user is optional — leave empty (or omit) to use the User from ~/.ssh/config
+
+servers:
+  # Direct IP with user
+  - user: admin
+    host: 192.168.1.50
+    path: /opt/thefoxup
+
+  # SSH config alias (IdentityFile, HostName, Port from ~/.ssh/config)
+  - user: ""                     # Empty = use the User from ~/.ssh/config
+    host: my-ssh-alias           # Alias defined in ~/.ssh/config with custom key
+    path: /home/deploy/thefoxup
