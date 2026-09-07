@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# thefoxup v1.0.0 - Common update functions for Debian/Ubuntu
+# thefoxup - Common update functions for Debian/Ubuntu
 # https://github.com/Morphilab/thefoxup
 
 # Color support (only if running in a terminal)
@@ -14,17 +14,23 @@ init_colors() {
     BOLD=$(tput bold)
     RESET=$(tput sgr0)
   else
+    # shellcheck disable=SC2034  # BOLD is used by foxup.sh's interactive banner
     RED="" GREEN="" YELLOW="" BLUE="" BOLD="" RESET=""
   fi
 }
 
-# Logging
-LOG_DIR="/var/log/thefoxup"
+LOG_DIR="${THEFOXUP_LOG_DIR:-/var/log/thefoxup}"
 LOG_FILE=""
 readonly LOG_DIR
 readonly LOG_CLEAN_DAYS="${THEFOXUP_LOG_CLEAN_DAYS:-30}"
 readonly REBOOT_DELAY="${THEFOXUP_REBOOT_DELAY:-10}"
 readonly APT_TIMEOUT="${THEFOXUP_APT_TIMEOUT:-600}"
+
+# Validate that an environment value is a non-negative integer
+require_uint() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || { echo "${RED}❌ $name must be a non-negative integer (got: '$value')${RESET}" >&2; return 1; }
+}
 
 init_logging() {
   local ts
@@ -44,11 +50,11 @@ log_event() {
 check_apt_sources() {
   local sources=0
   [[ -f /etc/apt/sources.list ]] && ((++sources))
+  local -a extra_sources=()
   shopt -s nullglob
-  for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    ((++sources))
-  done
+  extra_sources=(/etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources)
   shopt -u nullglob
+  ((sources += ${#extra_sources[@]}))
 
   if [[ "$sources" -eq 0 ]]; then
     echo "${YELLOW}⚠️  No apt sources found.${RESET}" >&2
@@ -93,8 +99,11 @@ apt_with_retry() {
     local _marker
     _marker="---apt_$(date +%s%N)---"
     echo "$_marker" >> "$LOG_FILE"
-    timeout "$APT_TIMEOUT" "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" || true
-    local ret=${PIPESTATUS[0]}
+    # LC_ALL=C keeps apt lock-error messages predictable regardless of locale.
+    # Capture the exit status inside the || branch: with pipefail, an
+    # unconditional `|| true` would clobber PIPESTATUS to 0 and mask failures.
+    local ret=0
+    timeout "$APT_TIMEOUT" env LC_ALL=C "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" || ret=${PIPESTATUS[0]}
     if [[ "$ret" -eq 0 ]]; then
       log_event "$label succeeded"
       return 0
@@ -133,7 +142,6 @@ update_system() {
   return 0
 }
 
-# Reboot helper
 do_reboot() {
   local prompt_confirm="$1"
   if [[ "$prompt_confirm" -eq 1 ]]; then
@@ -147,7 +155,6 @@ do_reboot() {
   reboot
 }
 
-# Shutdown helper
 do_shutdown() {
   local prompt_confirm="$1"
   if [[ "$prompt_confirm" -eq 1 ]]; then
@@ -161,51 +168,43 @@ do_shutdown() {
   poweroff
 }
 
-# Unified mode execution
-execute_mode() {
-  local mode="$1"
-  local dry_run="${THEFOXUP_DRY_RUN:-0}"
-  local prompt_confirm="${THEFOXUP_PROMPT_CONFIRM:-0}"
-
-  # Check mode: read-only system status
-  if [[ "$mode" == "check" ]]; then
-    echo "${BLUE}🔍 System status check...${RESET}"
-    validate_environment
-    echo
-    echo "${BLUE}📦 Upgradable packages:${RESET}"
-    apt list --upgradable 2>/dev/null | grep -v '^Listing...' || echo "  (none)"
-    echo
-    echo "${BLUE}💾 Disk usage:${RESET}"
-    df -h / /var /var/cache/apt 2>/dev/null | sed 's/^/  /'
-    echo
-    echo "${BLUE}📋 Last log:${RESET}"
-    local last_log
-    last_log=$(find "$LOG_DIR" -name 'update_*.log' -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
-    if [[ -n "$last_log" ]]; then
-      echo "  File: $last_log"
-      tail -5 "$last_log" 2>/dev/null | sed 's/^/  /'
-    else
-      echo "  (no logs yet)"
-    fi
-    return 0
-  fi
-
+# Read-only system status report (check mode)
+run_mode_check() {
+  echo "${BLUE}🔍 System status check...${RESET}"
   validate_environment
-  init_logging
-  local hostname_str
-  hostname_str=$(timeout 2 hostname -f 2>/dev/null || hostname)
-  log_event "thefoxup started — mode=$mode dry_run=$dry_run host=$hostname_str"
-  log_event "Environment validated"
-
-  # Dry-run: refresh cache and show what would be updated, then exit
-  if [[ "$dry_run" -eq 1 ]]; then
-    echo "${BLUE}📋 Dry-run: refreshing package cache...${RESET}"
-    apt-get update 2>&1 | tee -a "$LOG_FILE" || true
-    echo "${BLUE}📦 Packages that would be upgraded:${RESET}"
-    apt list --upgradable 2>/dev/null | tee -a "$LOG_FILE" || true
-    log_event "Dry-run completed"
-    return 0
+  echo
+  echo "${BLUE}📦 Upgradable packages:${RESET}"
+  apt list --upgradable 2>/dev/null | grep -v '^Listing...' || echo "  (none)"
+  echo
+  echo "${BLUE}💾 Disk usage:${RESET}"
+  df -h / /var /var/cache/apt 2>/dev/null | sed 's/^/  /'
+  echo
+  echo "${BLUE}📋 Last log:${RESET}"
+  local last_log
+  last_log=$(find "$LOG_DIR" -name 'update_*.log' -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+  if [[ -n "$last_log" ]]; then
+    echo "  File: $last_log"
+    tail -5 "$last_log" 2>/dev/null | sed 's/^/  /'
+  else
+    echo "  (no logs yet)"
   fi
+  return 0
+}
+
+# Dry-run: refresh cache and show what would be updated, apply nothing.
+# Caller must have initialized logging ($LOG_FILE).
+run_dry_run() {
+  echo "${BLUE}📋 Dry-run: refreshing package cache...${RESET}"
+  apt-get update 2>&1 | tee -a "$LOG_FILE" || true
+  echo "${BLUE}📦 Packages that would be upgraded:${RESET}"
+  apt list --upgradable 2>/dev/null | tee -a "$LOG_FILE" || true
+  log_event "Dry-run completed"
+}
+
+# Apply updates and finish according to mode (lite|full|off)
+run_update_flow() {
+  local mode="$1"
+  local prompt_confirm="$2"
 
   update_system || { log_event "System update FAILED"; return 1; }
   log_event "System update completed"
@@ -221,10 +220,48 @@ execute_mode() {
     off)
       do_shutdown "$prompt_confirm" || return 1
       ;;
+  esac
+}
+
+# Unified mode execution
+execute_mode() {
+  local mode="$1"
+  local dry_run="${THEFOXUP_DRY_RUN:-0}"
+  local prompt_confirm="${THEFOXUP_PROMPT_CONFIRM:-1}"
+
+  # Reject non-numeric environment overrides early (defense in depth)
+  require_uint "THEFOXUP_DRY_RUN" "$dry_run" || return 1
+  require_uint "THEFOXUP_PROMPT_CONFIRM" "$prompt_confirm" || return 1
+  require_uint "THEFOXUP_APT_TIMEOUT" "$APT_TIMEOUT" || return 1
+  require_uint "THEFOXUP_REBOOT_DELAY" "$REBOOT_DELAY" || return 1
+  require_uint "THEFOXUP_LOG_CLEAN_DAYS" "$LOG_CLEAN_DAYS" || return 1
+
+  # Check mode: read-only system status
+  if [[ "$mode" == "check" ]]; then
+    run_mode_check
+    return
+  fi
+
+  # Unknown modes are rejected before any system operation (fail fast)
+  case "$mode" in
+    lite|full|off) ;;
     *)
-      echo "${RED}❌ Unknown mode: $mode${RESET}"
-      log_event "ERROR: Unknown mode ($mode)"
+      echo "${RED}❌ Unknown mode: $mode${RESET}" >&2
       return 1
       ;;
   esac
+
+  validate_environment
+  init_logging
+  local hostname_str
+  hostname_str=$(timeout 2 hostname -f 2>/dev/null || hostname)
+  log_event "thefoxup started — mode=$mode dry_run=$dry_run host=$hostname_str"
+  log_event "Environment validated"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    run_dry_run
+    return 0
+  fi
+
+  run_update_flow "$mode" "$prompt_confirm"
 }
