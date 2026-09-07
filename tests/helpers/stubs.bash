@@ -123,6 +123,8 @@ load_sandboxed_library() {
   # shellcheck source=../update_functions.sh
   source "$PROJECT_ROOT/update_functions.sh"
   init_colors
+  # shellcheck disable=SC2317,SC2329 # sandbox redefinitions, invoked by bats
   validate_environment() { :; }
+  # shellcheck disable=SC2317,SC2329 # sandbox redefinitions, invoked by bats
   init_logging() { init_test_log; }
 }

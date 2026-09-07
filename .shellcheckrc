@@ -4,8 +4,8 @@
 # Severity level (error, warning, info)
 severity=warning
 
-# Exclude source-following noise (sources resolve when all scripts are passed together)
-exclude=SC1091
+# Disable source-following noise (sources resolve when all scripts are passed together)
+disable=SC1091
 
 # Target shell
 shell=bash

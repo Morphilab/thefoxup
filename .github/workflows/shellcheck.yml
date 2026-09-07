@@ -19,6 +19,7 @@ jobs:
         uses: ludeeus/action-shellcheck@2.0.0
         with:
           scandir: ./
+          check_together: true
           format: gcc
 
       - name: Smoke tests
