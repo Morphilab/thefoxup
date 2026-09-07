@@ -1,7 +1,7 @@
 # TheFoxUp
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/Morphilab/thefoxup/releases/tag/v1.0.0)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/Morphilab/thefoxup/releases/tag/v1.1.0)
 [![ShellCheck](https://github.com/Morphilab/thefoxup/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/Morphilab/thefoxup/actions/workflows/shellcheck.yml)
 [![Bash](https://img.shields.io/badge/bash-5%2B-green.svg)](https://www.gnu.org/software/bash/)
 
@@ -30,7 +30,7 @@ Este proyecto fue desarrollado con asistencia de herramientas de inteligencia ar
 ## Requirements
 - Debian 11/12 or Ubuntu 20.04/22.04/24.04
 - Root privileges (`sudo`)
-- `yq` — `sudo apt install yq`
+- `yq` (v3+) — `sudo apt install yq` (the apt package and the [Go binary](https://github.com/mikefarah/yq/releases) both work with the syntax used)
 - `flock` (util-linux) — `sudo apt install util-linux`
 - `timeout`, `base64` (coreutils) — `sudo apt install coreutils`
 - SSH keys for remote servers (recommended)
@@ -39,15 +39,17 @@ Este proyecto fue desarrollado con asistencia de herramientas de inteligencia ar
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `THEFOXUP_DRY_RUN` | `0` | Show what would be updated, then exit |
+| `THEFOXUP_DRY_RUN` | `0` | Show what would be updated (refreshes package cache), then exit |
 | `THEFOXUP_PROMPT_CONFIRM` | `1` | Enable confirmation prompts before reboot/shutdown (non-interactive) |
 | `THEFOXUP_LOCK` | `/var/run/thefoxup.lock` | Override lock file path |
 | `THEFOXUP_SSH_CONNECT_TIMEOUT` | `10` | SSH connect timeout in seconds |
 | `THEFOXUP_SSH_ALIVE_INTERVAL` | `30` | SSH keepalive interval in seconds |
 | `THEFOXUP_SSH_STRICT_HOST_KEY_CHECKING` | `accept-new` | SSH host key policy (`accept-new` trusts on first connection) |
-| `THEFOXUP_APT_TIMEOUT` | `600` | Max time in seconds for remote apt operations |
+| `THEFOXUP_APT_TIMEOUT` | `600` | Max time in seconds for each remote apt command |
+| `THEFOXUP_REMOTE_SESSION_TIMEOUT` | `1800` | Max total time in seconds for a whole remote session |
 | `THEFOXUP_REBOOT_DELAY` | `10` | Delay in seconds before reboot/shutdown |
 | `THEFOXUP_MAX_PARALLEL` | `10` | Max concurrent remote SSH sessions |
+| `THEFOXUP_LOG_DIR` | `/var/log/thefoxup` | Directory where log files are written |
 | `THEFOXUP_LOG_CLEAN_DAYS` | `30` | Keep log files for N days |
 
 ## Quick Start
@@ -55,7 +57,7 @@ Este proyecto fue desarrollado con asistencia de herramientas de inteligencia ar
 ```bash
 git clone https://github.com/Morphilab/thefoxup.git
 cd thefoxup
-chmod +x foxup.sh mode-*.sh update_functions.sh
+chmod +x foxup.sh mode.sh mode-*.sh update_functions.sh remote_functions.sh
 cp servers.example.yaml servers.yaml
 # Edit servers.yaml with your servers
 sudo ./foxup.sh
