@@ -3,6 +3,7 @@
 # Sensitive configuration files
 servers.conf
 servers.yaml
+.env
 
 # Execution locks
 *.lock

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# thefoxup v1.0.0 - Smoke test
+# thefoxup v1.1.0 - Smoke test
 # Lightweight validation that scripts load, parse flags, and exit cleanly.
 # Does NOT touch the system, network, or /var/log.
 # https://github.com/Morphilab/thefoxup
@@ -12,7 +12,9 @@ PASS=0
 FAIL=0
 FAILED_TESTS=()
 
+# shellcheck disable=SC2317  # helpers are invoked throughout this script
 pass() { echo "  ✅ $1"; ((++PASS)); }
+# shellcheck disable=SC2317  # helpers are invoked throughout this script
 fail() { echo "  ❌ $1"; ((++FAIL)); FAILED_TESTS+=("$1"); }
 
 echo "═══════════════════════════════════════════════════════"
@@ -22,7 +24,7 @@ echo
 
 # 1. All scripts are executable
 echo "1. Executable permissions"
-for f in foxup.sh mode.sh mode-lite.sh mode-full.sh mode-off.sh update_functions.sh; do
+for f in foxup.sh mode.sh mode-lite.sh mode-full.sh mode-off.sh update_functions.sh remote_functions.sh; do
   if [[ -x "$SCRIPT_DIR/$f" ]]; then
     pass "$f is executable"
   else
@@ -33,7 +35,7 @@ echo
 
 # 2. Bash syntax check on every script
 echo "2. Bash syntax (bash -n)"
-for f in foxup.sh mode.sh mode-lite.sh mode-full.sh mode-off.sh update_functions.sh; do
+for f in foxup.sh mode.sh mode-lite.sh mode-full.sh mode-off.sh update_functions.sh remote_functions.sh; do
   if bash -n "$SCRIPT_DIR/$f" 2>/dev/null; then
     pass "$f parses cleanly"
   else
@@ -44,8 +46,8 @@ echo
 
 # 3. --version and --help exit 0 with expected output
 echo "3. CLI flag handling"
-if out=$("$SCRIPT_DIR/foxup.sh" --version 2>&1) && [[ "$out" == *"thefoxup v1.0.0"* ]]; then
-  pass "--version prints 'thefoxup v1.0.0'"
+if out=$("$SCRIPT_DIR/foxup.sh" --version 2>&1) && [[ "$out" == *"thefoxup v1.1.0"* ]]; then
+  pass "--version prints the project version"
 else
   fail "--version did not print expected version (got: $out)"
 fi
@@ -95,7 +97,7 @@ else
 fi
 echo
 
-# 6. mode-*.sh wrappers delegate correctly to mode.sh
+# 6. mode-*.sh wrappers exist and are executable
 echo "6. Mode wrappers exist and are executable"
 for m in lite full off; do
   wrapper="$SCRIPT_DIR/mode-${m}.sh"
@@ -129,7 +131,7 @@ if [[ ! -f "$SCRIPT_DIR/servers.yaml" ]]; then
 elif git -C "$SCRIPT_DIR" ls-files --error-unmatch servers.yaml &>/dev/null; then
   fail "servers.yaml is TRACKED by git — should be gitignored"
 else
-  # File exists locally but is not tracked by git — expected for dev setups
+  # File exists locally but is not tracked by git — expected for local developer setups
   pass "servers.yaml exists locally but is NOT tracked by git"
 fi
 echo
@@ -149,6 +151,46 @@ if [[ -f "$SCRIPT_DIR/.github/workflows/shellcheck.yml" ]] && grep -q 'shellchec
   pass "GitHub Actions ShellCheck workflow present"
 else
   fail "CI workflow missing"
+fi
+echo
+
+# 11. Numeric environment validation
+echo "11. Numeric environment validation"
+if (
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/update_functions.sh" && \
+  init_colors && \
+  declare -f require_uint >/dev/null && \
+  ! require_uint "TEST_VAR" "abc" >/dev/null 2>&1 && \
+  require_uint "TEST_VAR" "42" >/dev/null 2>&1
+) 2>/dev/null; then
+  pass "require_uint rejects non-numeric values and accepts integers"
+else
+  fail "require_uint missing or misbehaving"
+fi
+echo
+
+# 12. Standalone mode dispatcher lock guard
+echo "12. mode.sh standalone lock"
+if grep -q 'flock' "$SCRIPT_DIR/mode.sh"; then
+  pass "mode.sh guards concurrent execution with flock"
+else
+  fail "mode.sh is missing flock protection"
+fi
+echo
+
+# 13. Split mode-execution subfunctions exist
+echo "13. Mode execution subfunctions"
+if (
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/update_functions.sh" && \
+  declare -f run_mode_check >/dev/null && \
+  declare -f run_dry_run >/dev/null && \
+  declare -f run_update_flow >/dev/null
+) 2>/dev/null; then
+  pass "execute_mode delegates to extracted subfunctions"
+else
+  fail "run_mode_check / run_dry_run / run_update_flow missing"
 fi
 echo
 

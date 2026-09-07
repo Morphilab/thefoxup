@@ -8,15 +8,24 @@ on:
 
 jobs:
   shellcheck:
-    name: ShellCheck
+    name: Lint and smoke tests
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
+        # Severity/exclusions come from .shellcheckrc
+        uses: ludeeus/action-shellcheck@v2
         with:
           scandir: ./
-          severity: error
           format: gcc
+
+      - name: Smoke tests
+        run: bash tests/smoke.sh
+
+      - name: Install bats and yq
+        run: sudo apt-get update && sudo apt-get install -y bats yq
+
+      - name: Functional tests (bats)
+        run: bats tests/
