@@ -1,68 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-# thefoxup v1.0.0 - Secure updater for Debian/Ubuntu servers
+# thefoxup v1.1.0 - Secure updater for Debian/Ubuntu servers
 # Main orchestrator with local + remote SSH support (YAML config)
 # https://github.com/Morphilab/thefoxup
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Consumed by load_servers_yaml() in remote_functions.sh
+# shellcheck disable=SC2034
 CONFIG_FILE="$SCRIPT_DIR/servers.yaml"
 LOCK="${THEFOXUP_LOCK:-/var/run/thefoxup.lock}"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
-# Configurable constants (override via environment)
-SSH_CONNECT_TIMEOUT="${THEFOXUP_SSH_CONNECT_TIMEOUT:-10}"
-SSH_SERVER_ALIVE_INTERVAL="${THEFOXUP_SSH_ALIVE_INTERVAL:-30}"
-SSH_STRICT_HOST_KEY_CHECKING="${THEFOXUP_SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
-APT_TIMEOUT="${THEFOXUP_APT_TIMEOUT:-600}"
-MAX_PARALLEL="${THEFOXUP_MAX_PARALLEL:-10}"
-
-# Load shared library and initialize colors
 source "$SCRIPT_DIR/update_functions.sh"
+source "$SCRIPT_DIR/remote_functions.sh"
 init_colors
-
-# Check if an SSH agent is available with loaded identities
-has_ssh_agent() {
-  [[ -n "${SSH_AUTH_SOCK:-}" ]] && ssh-add -l &>/dev/null
-}
-
-# SSH execution helper
-run_remote() {
-  local host="$1" user="$2" path="$3" mode="$4" server_idx="$5"
-  local ssh_target
-  local -a ssh_opts=()
-  local -a prefix=()
-
-  case "$mode" in
-    lite|full|off) ;;
-    *) echo "${RED}❌ Invalid mode '$mode' for server $((server_idx))${RESET}" >&2; return 1 ;;
-  esac
-
-  if [[ -n "$user" ]]; then
-    ssh_target="${user}@${host}"
-  else
-    ssh_target="${host}"
-  fi
-
-  ssh_opts=(-t)
-  ssh_opts+=(-o "ConnectTimeout=$SSH_CONNECT_TIMEOUT")
-  ssh_opts+=(-o "ServerAliveInterval=$SSH_SERVER_ALIVE_INTERVAL")
-  ssh_opts+=(-o "StrictHostKeyChecking=$SSH_STRICT_HOST_KEY_CHECKING")
-
-  if [[ -n "${SUDO_USER:-}" ]]; then
-    prefix=(sudo -u "$SUDO_USER")
-  fi
-
-  local b64_path
-  b64_path=$(printf '%s' "$path" | base64 -w0)
-
-  "${prefix[@]}" ssh "${ssh_opts[@]}" -- "$ssh_target" \
-    "sudo timeout $APT_TIMEOUT bash -c '
-       command -v base64 >/dev/null 2>&1 || { echo \"Missing base64 on remote\"; exit 1; }
-       dir=\$(base64 -d <<< \"$b64_path\")
-       if [[ ! -d \"\$dir\" ]]; then echo \"Remote path not found: \$dir\"; exit 1; fi
-       cd \"\$dir\" && ./foxup.sh $mode --yes'"
-}
 
 # === HELP AND VERSION ===
 show_help() {
@@ -112,7 +64,6 @@ echo "https://github.com/Morphilab/thefoxup"
 [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]] && show_help
 [[ "${1:-}" == "--version" ]] || [[ "${1:-}" == "-v" ]] && show_version
 
-# Check required dependencies
 for cmd in yq flock timeout base64; do
   if ! command -v "$cmd" &> /dev/null; then
     echo "${RED}❌ Error: '$cmd' is required${RESET}"
@@ -129,11 +80,16 @@ done
 # yq must be able to evaluate basic expressions
 if ! echo '{"a":1}' | yq -r '.a' &>/dev/null; then
   echo "${RED}❌ Error: yq is not working correctly${RESET}" >&2
-  echo "   Install the Go version of yq:" >&2
-  echo "   sudo apt install yq    # Ubuntu 24.04+ / Debian 12+" >&2
+  echo "   Install yq with: sudo apt install yq    # Ubuntu 24.04+ / Debian 12+" >&2
   echo "   Or download from: https://github.com/mikefarah/yq/releases" >&2
   exit 1
 fi
+
+# Validate numeric environment overrides early (defense in depth)
+require_uint "THEFOXUP_SSH_CONNECT_TIMEOUT" "$SSH_CONNECT_TIMEOUT" || exit 1
+require_uint "THEFOXUP_SSH_ALIVE_INTERVAL" "$SSH_SERVER_ALIVE_INTERVAL" || exit 1
+require_uint "THEFOXUP_MAX_PARALLEL" "$MAX_PARALLEL" || exit 1
+require_uint "THEFOXUP_REMOTE_SESSION_TIMEOUT" "$REMOTE_SESSION_TIMEOUT" || exit 1
 
 # Require root early (before interactive menu)
 if [[ "$EUID" -ne 0 ]]; then
@@ -146,139 +102,13 @@ fi
 mkdir -p "$(dirname "$LOCK")"
 exec {LOCK_FD}>"$LOCK"
 flock -n "$LOCK_FD" || { echo "${YELLOW}🔒 Another instance is already running${RESET}"; exit 1; }
+export THEFOXUP_LOCK_HELD=1
 
 # Cleanup on exit / interrupt
-trap 'exec {LOCK_FD}>&-; rm -f "$LOCK"' EXIT
+# Keep the lockfile on disk (only close the FD) — unlinking it would open a
+# race where a second instance locks the old inode while a third recreates it.
+trap 'exec {LOCK_FD}>&-' EXIT
 trap 'echo; echo "${RED}⏹ Interrupted by user${RESET}" >&2; exit 130' INT TERM
-
-# === SHARED FUNCTIONS (used by both CLI and interactive flows) ===
-
-# Load servers from YAML config into global arrays
-# Sets: USERS[], HOSTS[], PATHS[]
-# Returns 0 on success, 1 on failure (prints diagnostic to stderr)
-load_servers_yaml() {
-  USERS=() HOSTS=() PATHS=()
-
-  if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "${YELLOW}⚠️  servers.yaml not found${RESET}" >&2
-    echo "   Copy servers.example.yaml to servers.yaml and configure it" >&2
-    return 1
-  fi
-
-  if ! yq '.' "$CONFIG_FILE" &>/dev/null; then
-    echo "${RED}❌ servers.yaml has invalid YAML syntax${RESET}" >&2
-    return 2
-  fi
-
-  local password_warned=0
-
-  while IFS= read -r user && IFS= read -r host && IFS= read -r path && IFS= read -r pwd; do
-    USERS+=("$user")
-    HOSTS+=("$host")
-    PATHS+=("$path")
-    pwd="${pwd#null}"; [[ -n "$pwd" ]] && password_warned=1
-  done < <(yq -r '.servers[] | .user // "", .host // "", .path // "", (.password // null | tostring)' "$CONFIG_FILE" 2>/dev/null)
-
-  if [[ "$password_warned" -eq 1 ]]; then
-    echo "${YELLOW}⚠️  password field is deprecated and ignored — use key-based SSH auth only${RESET}" >&2
-  fi
-
-  if [[ ${#HOSTS[@]} -lt 1 ]]; then
-    echo "${YELLOW}⚠️  No servers configured in servers.yaml${RESET}" >&2
-    return 1
-  fi
-
-  return 0
-}
-
-# Validate servers loaded by load_servers_yaml()
-# Returns 0 on success, 1 on failure (prints diagnostic to stderr)
-validate_servers() {
-  for i in "${!HOSTS[@]}"; do
-    if [[ -z "${HOSTS[i]}" || -z "${PATHS[i]}" ]]; then
-      echo "${RED}❌ Server $((i+1)) has an empty or missing host or path — check servers.yaml${RESET}" >&2
-      return 1
-    fi
-    if [[ -n "${USERS[i]}" && ! "${USERS[i]}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-      echo "${RED}❌ Server $((i+1)): invalid characters in user '${USERS[i]}'${RESET}" >&2
-      echo "   Only alphanumeric, dots, dashes, and underscores allowed" >&2
-      return 1
-    fi
-    if [[ -n "${HOSTS[i]}" && ! "${HOSTS[i]}" =~ ^[a-zA-Z0-9._:-]+$ ]]; then
-      echo "${RED}❌ Server $((i+1)): invalid characters in host '${HOSTS[i]}'${RESET}" >&2
-      echo "   Only alphanumeric, dots, dashes, colons, and underscores allowed" >&2
-      return 1
-    fi
-    if [[ -n "${PATHS[i]}" && ! "${PATHS[i]}" =~ ^/[a-zA-Z0-9/._-]+$ ]]; then
-      echo "${RED}❌ Server $((i+1)): invalid characters in path '${PATHS[i]}'${RESET}" >&2
-      echo "   Path must be absolute and use only safe characters" >&2
-      return 1
-    fi
-  done
-  return 0
-}
-
-# Run foxup on selected remote servers in parallel
-# $1: mode (lite|full|off)
-# $@: server indices (1-based), if none specified runs all servers
-# Returns 0 if all servers succeed, 1 if any fail
-run_remote_batch() {
-  local mode="$1"; shift
-  local -a selection
-  local failed_servers=0
-
-  if [[ $# -eq 0 ]]; then
-    for ((i=1; i<=${#HOSTS[@]}; i++)); do selection+=("$i"); done
-  else
-    selection=("$@")
-  fi
-
-  local _effective_parallel=$MAX_PARALLEL
-  if [[ ${#selection[@]} -gt 1 ]] && ! has_ssh_agent; then
-    echo "${YELLOW}⚠️  No SSH agent detected — running servers sequentially${RESET}" >&2
-    echo "   Tip: use ssh-agent for parallel execution (eval \$(ssh-agent) && ssh-add)" >&2
-    _effective_parallel=1
-  fi
-
-  local job_pids=()
-  local pid_labels=()
-
-  for idx in "${selection[@]}"; do
-    [[ "$idx" =~ ^[0-9]+$ ]] || { echo "${RED}❌ Invalid selection: '$idx' (not a number)${RESET}" >&2; continue; }
-    [[ "$idx" -gt "${#HOSTS[@]}" || "$idx" -lt 1 ]] && { echo "${RED}❌ Invalid server number: $idx (must be 1-${#HOSTS[@]})${RESET}" >&2; continue; }
-    local i=$((idx - 1))
-
-    if [[ ${#job_pids[@]} -ge "$_effective_parallel" ]]; then
-      wait -n 2>/dev/null || true
-      local alive=()
-      local alive_labels=()
-      for j in "${!job_pids[@]}"; do
-        if kill -0 "${job_pids[$j]}" 2>/dev/null; then
-          alive+=("${job_pids[$j]}")
-          alive_labels+=("${pid_labels[$j]}")
-        fi
-      done
-      job_pids=("${alive[@]}")
-      pid_labels=("${alive_labels[@]}")
-    fi
-
-    local label="${USERS[$i]:+${USERS[$i]}@}${HOSTS[$i]}"
-    echo "${BLUE}🔄 Running on $label (mode $mode)...${RESET}"
-    run_remote "${HOSTS[$i]}" "${USERS[$i]}" "${PATHS[$i]}" "$mode" "$idx" &
-    job_pids+=($!)
-    pid_labels+=("$label")
-  done
-
-  for i in "${!job_pids[@]}"; do
-    wait "${job_pids[$i]}" || { echo "${RED}❌ Failed: ${pid_labels[$i]}${RESET}" >&2; ((++failed_servers)); }
-  done
-
-  if [[ "$failed_servers" -gt 0 ]]; then
-    echo "${YELLOW}⚠️  $failed_servers server(s) failed${RESET}" >&2
-    return 1
-  fi
-  return 0
-}
 
 # === CLI ARGUMENT PARSING ===
 MODE=""
@@ -303,7 +133,10 @@ done
 # === NON-INTERACTIVE CLI MODE ===
 if [[ -n "$MODE" ]]; then
   export THEFOXUP_DRY_RUN=$DRY_RUN
-  if [[ "$YES_MODE" -eq 0 ]]; then
+  # Confirmation prompts default to enabled (update_functions.sh); --yes overrides
+  if [[ "$YES_MODE" -eq 1 ]]; then
+    export THEFOXUP_PROMPT_CONFIRM=0
+  else
     export THEFOXUP_PROMPT_CONFIRM=1
   fi
 
@@ -346,7 +179,6 @@ echo "${GREEN}Starting thefoxup...${RESET}"
 echo "A safe way to update your servers"
 echo
 
-# Select mode
 echo "Select operation mode:"
 select mode in lite full off check "Cancel"; do
   [[ "$mode" == "Cancel" ]] && { echo "${YELLOW}❌ Operation cancelled by user.${RESET}"; exit 1; }
@@ -360,7 +192,6 @@ if [[ "$mode" == "check" ]]; then
   exit 0
 fi
 
-# Select location
 echo
 echo "Where do you want to run thefoxup?"
 select location in "Local only" "Remotes only" "Local + Remotes" "Cancel"; do
