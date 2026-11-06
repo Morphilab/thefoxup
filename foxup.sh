@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# thefoxup v1.1.0 - Secure updater for Debian/Ubuntu servers
+# thefoxup v1.1.1 - Secure updater for Debian/Ubuntu servers
 # Main orchestrator with local + remote SSH support (YAML config)
 # https://github.com/Morphilab/thefoxup
 
@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC2034
 CONFIG_FILE="$SCRIPT_DIR/servers.yaml"
 LOCK="${THEFOXUP_LOCK:-/var/run/thefoxup.lock}"
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 source "$SCRIPT_DIR/update_functions.sh"
 source "$SCRIPT_DIR/remote_functions.sh"
@@ -88,8 +88,15 @@ fi
 # Validate numeric environment overrides early (defense in depth)
 require_uint "THEFOXUP_SSH_CONNECT_TIMEOUT" "$SSH_CONNECT_TIMEOUT" || exit 1
 require_uint "THEFOXUP_SSH_ALIVE_INTERVAL" "$SSH_SERVER_ALIVE_INTERVAL" || exit 1
-require_uint "THEFOXUP_MAX_PARALLEL" "$MAX_PARALLEL" || exit 1
-require_uint "THEFOXUP_REMOTE_SESSION_TIMEOUT" "$REMOTE_SESSION_TIMEOUT" || exit 1
+require_uint_min "THEFOXUP_MAX_PARALLEL" "$MAX_PARALLEL" 1 \
+  "0 would disable parallel scheduling" || exit 1
+require_uint_min "THEFOXUP_REMOTE_SESSION_TIMEOUT" "$REMOTE_SESSION_TIMEOUT" 1 \
+  "0 would disable the remote session bound" || exit 1
+require_uint_min "THEFOXUP_APT_TIMEOUT" "$APT_TIMEOUT" 1 \
+  "0 would disable the hard timeout and break the log reader deadline" || exit 1
+require_uint_min "THEFOXUP_APT_KILL_AFTER" "$APT_KILL_AFTER" 1 \
+  "0 would disable the forced kill" || exit 1
+require_uint "THEFOXUP_HEARTBEAT_INTERVAL" "$HEARTBEAT_INTERVAL" || exit 1
 
 # Require root early (before interactive menu)
 if [[ "$EUID" -ne 0 ]]; then

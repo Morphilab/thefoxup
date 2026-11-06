@@ -7,12 +7,12 @@ set -euo pipefail
 # Color support (only if running in a terminal)
 init_colors() {
   if [[ -t 1 ]]; then
-    RED=$(tput setaf 1)
-    GREEN=$(tput setaf 2)
-    YELLOW=$(tput setaf 3)
-    BLUE=$(tput setaf 4)
-    BOLD=$(tput bold)
-    RESET=$(tput sgr0)
+    RED=$(tput setaf 1 2>/dev/null || true)
+    GREEN=$(tput setaf 2 2>/dev/null || true)
+    YELLOW=$(tput setaf 3 2>/dev/null || true)
+    BLUE=$(tput setaf 4 2>/dev/null || true)
+    BOLD=$(tput bold 2>/dev/null || true)
+    RESET=$(tput sgr0 2>/dev/null || true)
   else
     # shellcheck disable=SC2034  # BOLD is used by foxup.sh's interactive banner
     RED="" GREEN="" YELLOW="" BLUE="" BOLD="" RESET=""
@@ -25,11 +25,35 @@ readonly LOG_DIR
 readonly LOG_CLEAN_DAYS="${THEFOXUP_LOG_CLEAN_DAYS:-30}"
 readonly REBOOT_DELAY="${THEFOXUP_REBOOT_DELAY:-10}"
 readonly APT_TIMEOUT="${THEFOXUP_APT_TIMEOUT:-600}"
+# Grace period between SIGTERM and SIGKILL for an apt command that stalls
+# past its timeout. Must be >= 1 (`timeout -k 0` disables the SIGKILL).
+readonly APT_KILL_AFTER="${THEFOXUP_APT_KILL_AFTER:-30}"
+# Heartbeat interval for long apt commands; 0 disables the heartbeat.
+readonly HEARTBEAT_INTERVAL="${THEFOXUP_HEARTBEAT_INTERVAL:-30}"
+# Lock files that indicate a dpkg/apt transaction is running (or did not clean
+# up). One list shared by the pre-flight check, the stall diagnostics and the
+# post-stall leftover cleanup, so the three can never drift apart — a holder
+# invisible to the diagnostics must not be eligible for the cleanup either.
+readonly APT_LOCK_FILES=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+                         /var/cache/apt/archives/lock /var/lib/apt/lists/lock)
 
 # Validate that an environment value is a non-negative integer
 require_uint() {
   local name="$1" value="$2"
   [[ "$value" =~ ^[0-9]+$ ]] || { echo "${RED}❌ $name must be a non-negative integer (got: '$value')${RESET}" >&2; return 1; }
+}
+
+# Validate that an environment value is an integer >= min. Some values accept 0
+# as "disabled", but the apt bounds do not: `timeout 0` removes the hard
+# timeout and `timeout -k 0` removes the forced kill, which is the opposite of
+# what those knobs exist for.
+require_uint_min() {
+  local name="$1" value="$2" min="$3" hint="${4:-}"
+  require_uint "$name" "$value" || return 1
+  [[ "$value" -ge "$min" ]] && return 0
+  echo "${RED}❌ $name must be >= $min (got: '$value')${RESET}" >&2
+  [[ -n "$hint" ]] && echo "   $hint" >&2
+  return 1
 }
 
 init_logging() {
@@ -74,19 +98,220 @@ validate_environment() {
     echo "${YELLOW}⚠️  Low disk space on /var/cache/apt (${avail}K available). Updates may fail.${RESET}" >&2
   fi
 
-  for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
-    if [[ -f "$lock" ]] && command -v fuser &>/dev/null; then
-      if fuser -s "$lock" 2>/dev/null; then
+  if command -v fuser >/dev/null 2>&1; then
+    for lock in "${APT_LOCK_FILES[@]}"; do
+      if [[ -f "$lock" ]] && fuser -s "$lock" 2>/dev/null; then
         echo "${RED}❌ dpkg/apt is locked by another process (${lock})${RESET}" >&2
         exit 1
       fi
-    fi
-  done
+    done
+  else
+    echo "${YELLOW}⚠️  fuser not available — skipping the apt/dpkg lock pre-check${RESET}" >&2
+  fi
 
   echo "${GREEN}✅ Environment validated successfully${RESET}"
 }
 
-# Execute an apt command with retry on lock conflict
+# Stop every background child of the watchdog. `jobs -p` is used instead of the
+# tracked PID so a sleep forked in the window between `sleep &` and `sp=$!` is
+# still caught: missing it would leave the sleep running as an orphan holding
+# inherited descriptors (e.g. the flock) until its interval expires.
+_apt_watchdog_cleanup() {
+  local pids
+  pids=$(jobs -p 2>/dev/null) || true
+  [[ -n "$pids" ]] || return 0
+  # shellcheck disable=SC2086  # unquoted on purpose: pids is a list
+  kill $pids 2>/dev/null || true
+}
+
+# Periodic heartbeat while a long apt command runs. Started in the background
+# by apt_with_retry and killed when the command finishes. The sleep child runs
+# in the background so the trap can reap it on TERM/INT: a foreground sleep
+# would survive as an orphan holding inherited descriptors (e.g. the flock)
+# for up to one interval after the script exits.
+_apt_watchdog() {
+  local start="$1" label="$2"
+  local now stop_at elapsed sp=""
+  [[ "$HEARTBEAT_INTERVAL" -gt 0 ]] || return 0
+  trap '_apt_watchdog_cleanup; exit 0' TERM INT
+  stop_at=$((start + APT_TIMEOUT + APT_KILL_AFTER + HEARTBEAT_INTERVAL + 5))
+  while :; do
+    sleep "$HEARTBEAT_INTERVAL" &
+    sp=$!
+    wait "$sp" 2>/dev/null || return 0
+    now=$(date +%s)
+    elapsed=$((now - start))
+    if [[ "$now" -ge "$stop_at" ]]; then
+      return 0
+    fi
+    echo "${YELLOW}⏳ ${label} still running… (${elapsed}s elapsed)${RESET}" >&2
+    log_event "${label}: still running (${elapsed}s elapsed)"
+  done
+}
+
+# Best-effort forensic snapshot appended to the log when an apt command had to
+# be stopped by the timeout. Must never fail the caller.
+dump_stall_diagnostics() {
+  local label="$1" log="$LOG_FILE"
+  if (
+    set +e
+    {
+      echo "--- stall diagnostics: ${label} ---"
+      date '+time: %F %T'
+      # shellcheck disable=SC2009  # pgrep cannot show state/etime/wchan columns
+      ps -eo pid,ppid,stat,etime,wchan:28,args --sort=etime 2>/dev/null \
+        | grep -E 'apt|dpkg|debconf|needrestart' | grep -v grep
+      if command -v fuser >/dev/null 2>&1; then
+        fuser -v "${APT_LOCK_FILES[@]}" 2>&1
+      fi
+      if [[ -f /var/log/dpkg.log ]]; then
+        tail -n 15 /var/log/dpkg.log 2>/dev/null
+      fi
+      if [[ -f /var/log/apt/history.log ]]; then
+        echo "--- apt history.log (tail) ---"
+        tail -n 15 /var/log/apt/history.log 2>/dev/null
+      fi
+      if [[ -f /var/log/apt/term.log ]]; then
+        echo "--- apt term.log (tail) ---"
+        tail -n 15 /var/log/apt/term.log 2>/dev/null
+      fi
+      if command -v journalctl >/dev/null 2>&1; then
+        journalctl -n 15 --no-pager 2>/dev/null
+      fi
+      echo "--- end stall diagnostics ---"
+    } >> "$log" 2>&1
+  ); then
+    echo "${YELLOW}🩺 Stall diagnostics saved to ${log}${RESET}" >&2
+  else
+    echo "${YELLOW}⚠️  Could not save stall diagnostics to ${log}${RESET}" >&2
+  fi
+}
+
+# True while $1 exists and is not a zombie (`kill -0` alone also matches
+# zombies, which hold no locks anymore but cannot be signalled away).
+_pid_is_running() {
+  local state
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  [[ -n "$state" && "$state" != Z* ]]
+}
+
+# Render PIDs as "1234(dpkg) 5678(apt-get)" for operator messages and logs.
+_describe_pids() {
+  local pid comm out=""
+  for pid in "$@"; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || comm=""
+    out+="${out:+ }${pid}(${comm:-unknown})"
+  done
+  printf '%s' "$out"
+}
+
+# Ask whatever still holds the apt/dpkg locks to stop, after a command was
+# stopped by the timeout. A lock holder at that point is either a leftover of
+# that command or a concurrent apt/dpkg run, and both have to release the locks
+# before the next run can work. SIGTERM goes first so a responsive apt/dpkg can
+# abort cleanly and release the locks itself; only the processes that ignore it
+# are force-stopped, which is what keeps TERM-immune leftovers from holding the
+# locks (and the log pipe) forever. Best effort: never fails the caller.
+_stop_leftover_lock_holders() {
+  if ! command -v fuser >/dev/null 2>&1; then
+    echo "${YELLOW}⚠️  fuser not available — leftover apt/dpkg lock holders were not stopped${RESET}" >&2
+    log_event "fuser not available: leftover apt/dpkg lock holders were not stopped"
+    return 0
+  fi
+
+  local pids pid
+  pids=$(fuser "${APT_LOCK_FILES[@]}" 2>/dev/null) || true
+  local -a targets=()
+  for pid in $pids; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" -eq "$$" || "$pid" -eq "$PPID" ]] && continue
+    targets+=("$pid")
+  done
+  [[ ${#targets[@]} -gt 0 ]] || return 0
+
+  local desc
+  desc=$(_describe_pids "${targets[@]}")
+  echo "${YELLOW}🧹 Lock holders asked to stop: ${desc}${RESET}" >&2
+  log_event "Leftover apt/dpkg lock holders asked to stop (SIGTERM): ${desc}"
+  kill -TERM "${targets[@]}" 2>/dev/null || true
+
+  # Bounded grace for a clean abort, then force-stop only the survivors.
+  local waited=0
+  while [[ "$waited" -lt "$APT_KILL_AFTER" ]]; do
+    local -a alive=()
+    for pid in "${targets[@]}"; do
+      _pid_is_running "$pid" && alive+=("$pid")
+    done
+    [[ ${#alive[@]} -gt 0 ]] || return 0
+    sleep 1
+    ((++waited))
+  done
+
+  local -a stubborn=()
+  for pid in "${targets[@]}"; do
+    _pid_is_running "$pid" && stubborn+=("$pid")
+  done
+  [[ ${#stubborn[@]} -gt 0 ]] || return 0
+
+  desc=$(_describe_pids "${stubborn[@]}")
+  echo "${YELLOW}🧹 Lock holders that ignored SIGTERM were force-stopped: ${desc}${RESET}" >&2
+  log_event "Leftover apt/dpkg lock holders force-stopped (ignored SIGTERM): ${desc}"
+  kill -KILL "${stubborn[@]}" 2>/dev/null || true
+  return 0
+}
+
+# Run an apt command under the hard timeout, streaming its output to the
+# console and the log through a bounded reader: some timeout implementations
+# (e.g. uutils) SIGKILL only the direct child, and a surviving child still
+# holding the pipe open would otherwise make the reader wait forever.
+# Returns the command's exit status; a reader that had to be stopped is logged.
+_apt_run_bounded() {
+  local label="$1"
+  shift
+  # The reader's deadline is strictly after the apt kill window, so it only
+  # fires when a survivor is still holding the pipe.
+  local deadline=$((APT_TIMEOUT + APT_KILL_AFTER + 5))
+  local rc=0 reader_rc=0
+
+  # SIGTERM at $APT_TIMEOUT; if the command ignores it, SIGKILL after
+  # $APT_KILL_AFTER more seconds instead of waiting forever.
+  # </dev/null stops a hidden maintainer-script/debconf read from blocking on
+  # the caller's terminal. LC_ALL=C keeps apt lock-error messages predictable
+  # regardless of locale.
+  # Capture the exit statuses inside the || branch: with pipefail, an
+  # unconditional `|| true` would clobber PIPESTATUS to 0 and mask failures.
+  timeout -k "$APT_KILL_AFTER" "$APT_TIMEOUT" env LC_ALL=C "$@" </dev/null 2>&1 \
+    | timeout -k 5 "$deadline" tee -a "$LOG_FILE" \
+    || { rc=${PIPESTATUS[0]} reader_rc=${PIPESTATUS[1]:-0}; }
+
+  if [[ "$reader_rc" -ne 0 ]]; then
+    log_event "${label}: output reader stopped (survivors held the log pipe)"
+  fi
+  return "$rc"
+}
+
+# Run a read-only apt query bounded by the hard timeout, streaming its output
+# to the console through a bounded reader and appending it to the log when one
+# is active (check mode runs without a log file and must not create one, hence
+# the /dev/null sink). A query that had to be stopped is reported on stderr, so
+# a stopped query is never silently shown as "nothing to upgrade".
+_apt_run_query() {
+  local label="$1"
+  shift
+  local deadline=$((APT_TIMEOUT + APT_KILL_AFTER + 5))
+  local rc=0
+
+  timeout -k "$APT_KILL_AFTER" "$APT_TIMEOUT" env LC_ALL=C "$@" </dev/null 2>/dev/null \
+    | timeout -k 5 "$deadline" tee -a "${LOG_FILE:-/dev/null}" \
+    || rc=${PIPESTATUS[0]}
+
+  if [[ "$rc" -ne 0 ]]; then
+    echo "${YELLOW}⚠️  ${label} did not complete (rc=$rc) — results may be incomplete${RESET}" >&2
+  fi
+  return "$rc"
+}
+
+# Execute an apt command with a hard timeout, heartbeat and stall forensics
 apt_with_retry() {
   local label="$1"
   shift
@@ -96,18 +321,53 @@ apt_with_retry() {
 
   while [[ "$attempt" -le "$max_attempts" ]]; do
     echo "${BLUE}${label} (attempt $attempt/$max_attempts)...${RESET}"
-    local _marker
+    local _marker _start _wd_pid="" ret=0 _elapsed
     _marker="---apt_$(date +%s%N)---"
     echo "$_marker" >> "$LOG_FILE"
-    # LC_ALL=C keeps apt lock-error messages predictable regardless of locale.
-    # Capture the exit status inside the || branch: with pipefail, an
-    # unconditional `|| true` would clobber PIPESTATUS to 0 and mask failures.
-    local ret=0
-    timeout "$APT_TIMEOUT" env LC_ALL=C "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE" || ret=${PIPESTATUS[0]}
+    _start=$(date +%s)
+
+    if [[ "$HEARTBEAT_INTERVAL" -gt 0 ]]; then
+      _apt_watchdog "$_start" "$label" &
+      _wd_pid=$!
+    fi
+
+    _apt_run_bounded "$label" "${cmd[@]}" || ret=$?
+
+    if [[ -n "$_wd_pid" ]]; then
+      kill "$_wd_pid" 2>/dev/null || true
+      wait "$_wd_pid" 2>/dev/null || true
+    fi
+
+    _elapsed=$(( $(date +%s) - _start ))
+
     if [[ "$ret" -eq 0 ]]; then
-      log_event "$label succeeded"
+      log_event "$label succeeded (${_elapsed}s)"
       return 0
     fi
+
+    case "$ret" in
+      124|137|141|143)
+        if [[ "$ret" -eq 137 ]]; then
+          echo "${RED}⏱  ${label} was force-killed with SIGKILL (rc=137) — it ignored SIGTERM or the system killed it (e.g. OOM)${RESET}" >&2
+        elif [[ "$ret" -eq 141 ]]; then
+          echo "${RED}⏱  ${label} died on SIGPIPE (rc=141) — its output reader was stopped mid-run${RESET}" >&2
+        elif [[ "$ret" -eq 124 ]]; then
+          echo "${RED}⏱  ${label} timed out after ${APT_TIMEOUT}s and was stopped${RESET}" >&2
+        else
+          echo "${RED}⏱  ${label} was terminated by a signal (rc=$ret)${RESET}" >&2
+        fi
+        echo "   If dpkg was interrupted, run: sudo dpkg --configure -a" >&2
+        log_event "$label stopped after ${_elapsed}s (rc=$ret; timeout=${APT_TIMEOUT}s kill-after=${APT_KILL_AFTER}s)"
+        dump_stall_diagnostics "$label"
+        # Some timeout implementations (e.g. uutils on Ubuntu 26.04) send the
+        # SIGKILL only to the direct child, leaving TERM-immune dpkg children
+        # alive and still holding the apt/dpkg locks. Release those locks so the
+        # next run is not blocked by leftovers of this one.
+        _stop_leftover_lock_holders
+        return "$ret"
+        ;;
+    esac
+
     if sed -n "/$_marker/,\$p" "$LOG_FILE" 2>/dev/null | grep -q "Could not get lock\|is locked by another process"; then
       echo "${YELLOW}⚠️  apt lock held, retrying in 5s...${RESET}"
       sleep 5
@@ -122,6 +382,19 @@ apt_with_retry() {
   return 1
 }
 
+# Run a best-effort apt sub-command: ordinary failures are tolerated, but being
+# stopped by the timeout or by a signal (rc 124/137/141/143) is fatal — the
+# system may need `dpkg --configure -a`, so the caller must not continue (e.g.
+# to reboot).
+apt_best_effort() {
+  local rc=0
+  apt_with_retry "$@" || rc=$?
+  case "$rc" in
+    124|137|141|143) return "$rc" ;;
+  esac
+  return 0
+}
+
 update_system() {
   check_apt_sources || { echo "${RED}❌ Cannot update: no apt sources configured${RESET}" >&2; return 1; }
   echo "${BLUE}📦 Updating package lists...${RESET}"
@@ -132,11 +405,12 @@ update_system() {
     -o Dpkg::Options::="--force-confold" || return 1
 
   echo "${BLUE}🧹 Cleaning up unnecessary packages...${RESET}"
-  dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null \
+  # shellcheck disable=SC2016  # ${Package} is a dpkg-query format field, not a shell expansion
+  timeout -k "$APT_KILL_AFTER" "$APT_TIMEOUT" dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null \
     | awk -v k="linux-image-$(uname -r)" '$0 == k' 2>/dev/null \
-    | xargs -r apt-mark manual 2>/dev/null || true
-  apt_with_retry "Autoremove" apt-get autoremove -y || true
-  apt_with_retry "Autoclean" apt-get autoclean || true
+    | xargs -r timeout -k "$APT_KILL_AFTER" "$APT_TIMEOUT" apt-mark manual 2>/dev/null || true
+  apt_best_effort "Autoremove" apt-get autoremove -y || return 1
+  apt_best_effort "Autoclean" apt-get autoclean || return 1
 
   echo "${GREEN}✅ System updated successfully${RESET}"
   return 0
@@ -144,9 +418,14 @@ update_system() {
 
 do_reboot() {
   local prompt_confirm="$1"
+  local answer=""
   if [[ "$prompt_confirm" -eq 1 ]]; then
     echo
-    read -r -p "System will REBOOT. Continue? [y/N] " answer
+    if ! read -r -p "System will REBOOT. Continue? [y/N] " answer; then
+      echo "${RED}❌ No interactive input available — reboot aborted${RESET}" >&2
+      log_event "Reboot aborted: no interactive input"
+      return 1
+    fi
     [[ "$answer" =~ ^[Yy]$ ]] || { echo "${YELLOW}❌ Reboot cancelled${RESET}"; log_event "User cancelled reboot"; return 1; }
   fi
   echo "${YELLOW}🔄 Rebooting in ${REBOOT_DELAY} seconds... (Ctrl+C to cancel)${RESET}"
@@ -157,9 +436,14 @@ do_reboot() {
 
 do_shutdown() {
   local prompt_confirm="$1"
+  local answer=""
   if [[ "$prompt_confirm" -eq 1 ]]; then
     echo
-    read -r -p "System will SHUT DOWN. Continue? [y/N] " answer
+    if ! read -r -p "System will SHUT DOWN. Continue? [y/N] " answer; then
+      echo "${RED}❌ No interactive input available — shutdown aborted${RESET}" >&2
+      log_event "Shutdown aborted: no interactive input"
+      return 1
+    fi
     [[ "$answer" =~ ^[Yy]$ ]] || { echo "${YELLOW}❌ Shutdown cancelled${RESET}"; log_event "User cancelled shutdown"; return 1; }
   fi
   echo "${RED}⏻ Shutting down in ${REBOOT_DELAY} seconds... (Ctrl+C to cancel)${RESET}"
@@ -174,7 +458,7 @@ run_mode_check() {
   validate_environment
   echo
   echo "${BLUE}📦 Upgradable packages:${RESET}"
-  apt list --upgradable 2>/dev/null | grep -v '^Listing...' || echo "  (none)"
+  _apt_run_query "Package query" apt list --upgradable | grep -v '^Listing\.\.\.' || echo "  (none)"
   echo
   echo "${BLUE}💾 Disk usage:${RESET}"
   df -h / /var /var/cache/apt 2>/dev/null | sed 's/^/  /'
@@ -195,9 +479,14 @@ run_mode_check() {
 # Caller must have initialized logging ($LOG_FILE).
 run_dry_run() {
   echo "${BLUE}📋 Dry-run: refreshing package cache...${RESET}"
-  apt-get update 2>&1 | tee -a "$LOG_FILE" || true
+  local rc=0
+  _apt_run_bounded "Dry-run cache refresh" apt-get update || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "${YELLOW}⚠️  Package cache refresh failed (rc=$rc) — results below may be stale${RESET}" >&2
+    log_event "Dry-run cache refresh failed ($rc)"
+  fi
   echo "${BLUE}📦 Packages that would be upgraded:${RESET}"
-  apt list --upgradable 2>/dev/null | tee -a "$LOG_FILE" || true
+  _apt_run_query "Package listing" apt list --upgradable || true
   log_event "Dry-run completed"
 }
 
@@ -232,7 +521,11 @@ execute_mode() {
   # Reject non-numeric environment overrides early (defense in depth)
   require_uint "THEFOXUP_DRY_RUN" "$dry_run" || return 1
   require_uint "THEFOXUP_PROMPT_CONFIRM" "$prompt_confirm" || return 1
-  require_uint "THEFOXUP_APT_TIMEOUT" "$APT_TIMEOUT" || return 1
+  require_uint_min "THEFOXUP_APT_TIMEOUT" "$APT_TIMEOUT" 1 \
+    "0 would disable the hard timeout and break the log reader deadline" || return 1
+  require_uint_min "THEFOXUP_APT_KILL_AFTER" "$APT_KILL_AFTER" 1 \
+    "0 would disable the forced kill" || return 1
+  require_uint "THEFOXUP_HEARTBEAT_INTERVAL" "$HEARTBEAT_INTERVAL" || return 1
   require_uint "THEFOXUP_REBOOT_DELAY" "$REBOOT_DELAY" || return 1
   require_uint "THEFOXUP_LOG_CLEAN_DAYS" "$LOG_CLEAN_DAYS" || return 1
 

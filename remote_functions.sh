@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# thefoxup v1.1.0 - Remote execution functions (SSH batch layer)
+# thefoxup v1.1.1 - Remote execution functions (SSH batch layer)
 # https://github.com/Morphilab/thefoxup
 
 # Configurable constants (override via environment)
@@ -47,8 +47,10 @@ run_remote() {
   local b64_path
   b64_path=$(printf '%s' "$path" | base64 -w0)
 
+  # APT_KILL_AFTER (update_functions.sh) bounds how long a stopped session
+  # may linger before SIGKILL.
   "${prefix[@]}" ssh "${ssh_opts[@]}" -- "$ssh_target" \
-    "sudo timeout $REMOTE_SESSION_TIMEOUT bash -c '
+    "sudo timeout -k ${APT_KILL_AFTER:-30} $REMOTE_SESSION_TIMEOUT bash -c '
        command -v base64 >/dev/null 2>&1 || { echo \"Missing base64 on remote\"; exit 1; }
        dir=\$(base64 -d <<< \"$b64_path\")
        if [[ ! -d \"\$dir\" ]]; then echo \"Remote path not found: \$dir\"; exit 1; fi
@@ -129,6 +131,14 @@ run_remote_batch() {
   local mode="$1"; shift
   local -a selection
   local failed_servers=0
+
+  # Also protects a standalone-sourced library: foxup.sh validates this at
+  # startup, but a zero or non-numeric value must not reach the scheduler,
+  # where it would index an empty job array and die on an unbound variable.
+  if [[ ! "$MAX_PARALLEL" =~ ^[0-9]+$ ]] || [[ "$MAX_PARALLEL" -lt 1 ]]; then
+    echo "${RED}❌ THEFOXUP_MAX_PARALLEL must be a positive integer (got: '$MAX_PARALLEL')${RESET}" >&2
+    return 1
+  fi
 
   if [[ $# -eq 0 ]]; then
     for ((i=1; i<=${#HOSTS[@]}; i++)); do selection+=("$i"); done
