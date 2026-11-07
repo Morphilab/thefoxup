@@ -19,24 +19,49 @@ EOF
   chmod +x "$STUBS/$name"
 }
 
-# timeout shim: drops its first argument (the duration) and execs the rest.
+# timeout shim: records its arguments. Drops an optional "-k <grace>" and the
+# duration, then execs the real command. If $STUBS/timeout.rc exists, exits
+# with that code instead (simulates timeout stopping the command).
 make_timeout_stub() {
-  cat > "$STUBS/timeout" <<'EOF'
+  cat > "$STUBS/timeout" <<EOF
 #!/bin/bash
+printf 'timeout %s\n' "\$*" >> "$STUBS/calls.log"
+if [[ -f "$STUBS/timeout.rc" ]]; then
+  exit "\$(<"$STUBS/timeout.rc")"
+fi
+if [[ "\${1:-}" == "-k" ]]; then shift 2; fi
 shift
-exec "$@"
+exec "\$@"
 EOF
   chmod +x "$STUBS/timeout"
+}
+
+# Real-sleep stub used by heartbeat tests: the default sleep stub returns
+# instantly, which would make the watchdog busy-spin instead of waiting.
+make_real_sleep_stub() {
+  cat > "$STUBS/sleep" <<'EOF'
+#!/bin/bash
+exec /bin/sleep "$@"
+EOF
+  chmod +x "$STUBS/sleep"
 }
 
 # Stateful apt-get stub. Behavior controlled by files inside $STUBS:
 #   apt-get.locks_left -> first N calls print an apt lock error and exit 100
 #   apt-get.rc         -> exit code for normal calls        (default 0)
 #   apt-get.out        -> stdout for normal calls           (default empty)
+#   apt-get.delay      -> sleep N seconds before answering (slow apt)
+#   apt-get.read_stdin -> try to read one line from stdin and echo it back
 make_apt_get_stub() {
   cat > "$STUBS/apt-get" <<EOF
 #!/bin/bash
 printf '%s %s\n' "apt-get" "\$*" >> "$STUBS/calls.log"
+if [[ -f "$STUBS/apt-get.delay" ]]; then
+  /bin/sleep "\$(<"$STUBS/apt-get.delay")"
+fi
+if [[ -f "$STUBS/apt-get.read_stdin" ]]; then
+  if read -r line; then printf 'STDIN:%s\n' "\$line"; fi
+fi
 locks_file="$STUBS/apt-get.locks_left"
 if [[ -f "\$locks_file" ]]; then
   left=\$(<"\$locks_file")
@@ -63,6 +88,10 @@ common_setup() {
   mkdir -p "$STUBS"
   : > "$STUBS/calls.log"
   PATH="$STUBS:$PATH"
+  # Keep the apt heartbeat watchdog off by default in tests: the stubbed sleep
+  # returns instantly, which would make it spin instead of waiting. The
+  # heartbeat test overrides this and installs a real sleep stub.
+  export THEFOXUP_HEARTBEAT_INTERVAL=0
 
   make_timeout_stub
   make_apt_get_stub

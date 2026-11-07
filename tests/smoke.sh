@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# thefoxup v1.1.0 - Smoke test
+# thefoxup v1.1.1 - Smoke test
 # Lightweight validation that scripts load, parse flags, and exit cleanly.
 # Does NOT touch the system, network, or /var/log.
 # https://github.com/Morphilab/thefoxup
@@ -46,7 +46,7 @@ echo
 
 # 3. --version and --help exit 0 with expected output
 echo "3. CLI flag handling"
-if out=$("$SCRIPT_DIR/foxup.sh" --version 2>&1) && [[ "$out" == *"thefoxup v1.1.0"* ]]; then
+if out=$("$SCRIPT_DIR/foxup.sh" --version 2>&1) && [[ "$out" == *"thefoxup v1.1.1"* ]]; then
   pass "--version prints the project version"
 else
   fail "--version did not print expected version (got: $out)"
@@ -162,11 +162,16 @@ if (
   init_colors && \
   declare -f require_uint >/dev/null && \
   ! require_uint "TEST_VAR" "abc" >/dev/null 2>&1 && \
-  require_uint "TEST_VAR" "42" >/dev/null 2>&1
-) 2>/dev/null; then
-  pass "require_uint rejects non-numeric values and accepts integers"
+  require_uint "TEST_VAR" "42" >/dev/null 2>&1 && \
+  declare -f require_uint_min >/dev/null && \
+  ! require_uint_min "TEST_VAR" "0" 1 >/dev/null 2>&1 && \
+  require_uint_min "TEST_VAR" "3" 1 >/dev/null 2>&1
+) 2>/dev/null && \
+  grep -q 'require_uint_min "THEFOXUP_MAX_PARALLEL"' "$SCRIPT_DIR/foxup.sh" && \
+  grep -q 'require_uint_min "THEFOXUP_REMOTE_SESSION_TIMEOUT"' "$SCRIPT_DIR/foxup.sh"; then
+  pass "numeric env validation rejects invalid values and enforces minimums"
 else
-  fail "require_uint missing or misbehaving"
+  fail "numeric env validation missing or misbehaving"
 fi
 echo
 
@@ -191,6 +196,29 @@ if (
   pass "execute_mode delegates to extracted subfunctions"
 else
   fail "run_mode_check / run_dry_run / run_update_flow missing"
+fi
+echo
+
+# 14. apt stall hardening (kill-after, heartbeat, forensics, stdin isolation)
+echo "14. apt stall hardening"
+if (
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/update_functions.sh" && \
+  declare -f _apt_watchdog >/dev/null && \
+  declare -f _apt_watchdog_cleanup >/dev/null && \
+  declare -f _apt_run_bounded >/dev/null && \
+  declare -f _apt_run_query >/dev/null && \
+  declare -f _stop_leftover_lock_holders >/dev/null && \
+  declare -f dump_stall_diagnostics >/dev/null
+) 2>/dev/null && \
+  grep -q "timeout -k \"\$APT_KILL_AFTER\" \"\$APT_TIMEOUT\"" "$SCRIPT_DIR/update_functions.sh" && \
+  grep -q "timeout -k 5 \"\$deadline\" tee" "$SCRIPT_DIR/update_functions.sh" && \
+  ! grep -q 'fuser -k' "$SCRIPT_DIR/update_functions.sh" && \
+  grep -q '</dev/null' "$SCRIPT_DIR/update_functions.sh" && \
+  grep -q "timeout -k \${APT_KILL_AFTER" "$SCRIPT_DIR/remote_functions.sh"; then
+  pass "apt commands are bounded, isolated, heartbeated and their leftovers cleaned up"
+else
+  fail "apt stall hardening missing"
 fi
 echo
 

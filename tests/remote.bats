@@ -46,15 +46,23 @@ teardown() { common_teardown; }
   # The remote command spans multiple lines, so match against the whole log
   local_log=$(cat "$STUBS/calls.log")
   [[ "$local_log" == *"$expected_b64"* ]]
-  [[ "$local_log" == *"timeout 77 bash -c"* ]]
+  [[ "$local_log" == *"timeout -k 30 77 bash -c"* ]]
   [[ "$local_log" == *"./foxup.sh full --yes"* ]]
+}
+
+@test "run_remote applies kill-after grace to the session timeout" {
+  THEFOXUP_APT_KILL_AFTER=45
+  load_remote_library
+  run run_remote "h1" "admin" "/opt/x" "lite" "1"
+  [ "$status" -eq 0 ]
+  [[ "$(grep '^ssh ' "$STUBS/calls.log")" == *"sudo timeout -k 45 1800 bash -c"* ]]
 }
 
 @test "run_remote wraps in sudo -u when SUDO_USER is set" {
   load_remote_library
-  SUDO_USER=monkey run run_remote "h1" "admin" "/opt/x" "lite" "1"
+  SUDO_USER=testuser run run_remote "h1" "admin" "/opt/x" "lite" "1"
   [ "$status" -eq 0 ]
-  grep -q '^sudo -u monkey ssh ' "$STUBS/calls.log"
+  grep -q '^sudo -u testuser ssh ' "$STUBS/calls.log"
 }
 
 # --- load_servers_yaml -----------------------------------------------
@@ -112,7 +120,7 @@ write_config() {
     "  - user: admin" \
     "    host: h1" \
     "    path: /opt/x" \
-    "    password: secret"
+    "    password: dummy"
   run load_servers_yaml
   [ "$status" -eq 0 ]
   [[ "$output" == *"password field is deprecated"* ]]
@@ -228,4 +236,22 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"No SSH agent detected — running servers sequentially"* ]]
   [ "$(grep -c '^ssh ' "$STUBS/calls.log")" -eq 4 ]
+}
+
+@test "run_remote_batch rejects a zero max parallel" {
+  THEFOXUP_MAX_PARALLEL=0
+  load_batch_fixture
+  run run_remote_batch lite
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"THEFOXUP_MAX_PARALLEL must be a positive integer (got: '0')"* ]]
+  [[ "$(cat "$STUBS/calls.log")" == "" ]]
+}
+
+@test "run_remote_batch rejects a non-numeric max parallel" {
+  THEFOXUP_MAX_PARALLEL=abc
+  load_batch_fixture
+  run run_remote_batch lite
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"THEFOXUP_MAX_PARALLEL must be a positive integer (got: 'abc')"* ]]
+  [[ "$(cat "$STUBS/calls.log")" == "" ]]
 }
